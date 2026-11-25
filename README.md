@@ -1,78 +1,115 @@
-# Oxbridge Health Engineering Challenge: Prior Authorization API
+# Prior authorization API
 
-Before a patient can have certain procedures, their doctor's office must ask the health plan for approval. This is called a **prior authorization**.
+Proprietary utilization-management service. A provider office submits a future procedure, a reviewer decides each line, and the database can show who did it.
 
-Imagine you've just joined our team. Our Utilization Management (UM) team needs a new prior authorization service, and you're building the backend API. Below is a note from your tech lead, followed by the UM team's requirements in their own words.
+Synthetic people only. Do not load real member, patient, or provider data.
 
----
+## How to run
 
-## Note from your tech lead
+Requirements: Python 3.12 and Docker (or any Postgres 16 you can reach).
 
-- **Stack:** Python and PostgreSQL. It should be runnable on AWS; you don't need to deploy it. Framework and libraries are your call.
-- **AI tools:** Use AI coding tools; we do.
-- **Identity:** our identity service issues each caller a token containing their user ID and role. Fake it however you like. You don't need sign-up or login.
-- **Data:** seed data for members, providers, reviewers, coverage and patient–practice links is fine. You don't need screens or endpoints to manage it.
-- We'll be living with this code for years, and the UM team changes its mind often. Write it the way you'd want to find it.
-- These requirements came straight from the business. If something is unclear or seems to contradict something else, make a call and write it down, as you would on the job.
+```bash
+docker compose up -d
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/alembic upgrade head
+.venv/bin/python -m app.seed
+.venv/bin/uvicorn app.main:app --reload
+```
 
----
+Postgres listens on `127.0.0.1:54329`. The API listens on port 8000. Interactive docs are at http://127.0.0.1:8000/docs.
 
-## Requirements from the Utilization Management team
+`python -m app.seed` prints a bearer token for each synthetic user. Send it as `Authorization: Bearer <token>`. Those tokens stand in for the company identity service. They carry a user id and a role, and they are checked against the user row on every call.
 
-### Who uses it
-- **Members:** our patients.
-- **Provider offices:** doctors' offices submitting requests for their patients.
-- **Reviewers:** our nurses and physicians who decide requests.
-- **Operations admins:** they keep the work moving.
+```bash
+curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/v1/me -H "Authorization: Bearer <token>"
+```
 
-Each of these groups has its own roadmap. Their needs change independently, often on different teams, and we'll be adding new groups (auditors are next).
+Copy `.env.example` to `.env` to change the database URL, the token secret, or the optional documentation-model endpoint.
 
-### Submitting a request
-- Offices submit requests for their patients, but only for patients linked to their practice.
-- A request covers one or more procedures (CPT or HCPCS codes, each with a number of units), a diagnosis (ICD-10), and the planned date of service. Offices can attach a clinical note.
-- We don't accept requests for procedures that have already happened; those go through retro review, which isn't part of this project. We also don't accept requests more than a year out.
-- The patient must have active coverage on the date of service.
-- Our provider offices are nationwide, from Maine to Hawaii.
-- More than 30 units for a single procedure is almost always a typo.
-- Offices complain constantly that when we reject a submission, they can't tell why. Tell them exactly what to fix.
+Tests use a separate database, `priorauth_test`, on the same server:
 
-### Reviewing a request
-- Reviewers pick up new requests from the queue. Once a reviewer picks one up, it's theirs until they decide it or an admin hands it to someone else.
-- Some of our physicians also see patients. A reviewer must never review a request for a patient they treat.
-- Reviewers approve or deny each procedure individually, and any denial needs a reason. They submit their decision for the whole request at once.
-- Decisions are final. Appeals are a separate process and not part of this project.
+```bash
+docker compose exec postgres psql -U priorauth -c 'CREATE DATABASE priorauth_test'
+.venv/bin/pytest
+```
 
-### Who sees what
-- Members can see their requests and whether each procedure was approved. Clinical notes and reviewer reasoning are internal, and members must never see them.
-- Offices see the requests they submitted.
-- Admins see everything.
+`pytest` fails unless `app/` is at 100% line and branch coverage.
 
-### Compliance
-- We're audited regularly. For any request, we must be able to show every step: who did what, and when.
-- Last year an audit found a request marked "approved" with no record of who approved it. That cannot happen again.
-- We're a HIPAA-covered entity.
+The Dockerfile is the shape for AWS (a container in front of RDS). It is not required to run the tests.
 
-### Support
-- When an office calls to say "my submission didn't go through," our support desk needs to find out what happened.
+## What the API does
 
-### Partners
-- Several large provider groups will connect their own systems directly to this service. Their IT teams will build from our documentation alone.
+| Who | Can |
+| --- | --- |
+| Provider office | Submit for a member linked to that practice. See their own requests, including the note they wrote and the denial reason. |
+| Member | See their own requests and whether each procedure was approved. |
+| Reviewer | See the unassigned queue and the cases they hold. Pick up a case, then approve or deny every line in one submission. |
+| Operations admin | See everything. Hand a case to another reviewer. See reviewer load and the unsent decision notices. |
+| Support | Look up submission attempts, including ones we rejected. See status only, not the note or the reason. |
 
-### Wishlist (only if you have time)
-- Offices would love to be notified when a decision is made.
-- Team leads want to see how many open requests each reviewer has.
+Partners should send `Idempotency-Key` on `POST /v1/auth-requests`. The same key and the same body return the original result. The same key and a different body is a conflict. A rejected submission is stored, so support can answer "it didn't go through" with the problem list.
 
----
+A denial needs a reason code and a sentence the office can read. An approval cannot carry a denial reason. Decisions are final.
 
-## What to submit
+## Decisions
 
-Create your own copy of this repo (**Use this template → Private**), build your solution there using synthetic data only, and add `rgavrilov5` as a collaborator when you're done.
+**Date of service is a calendar date in the practice's timezone.** Maine and Hawaii do not share a "today." A date before today in that zone is retro review, which this service does not do. A date more than one calendar year out is rejected. The anniversary itself is accepted. Feb 29 rolls to Feb 28. The same calendar day is accepted even if the appointment time has already passed, because we do not store a time of day.
 
-Your README should include:
-- **How to run it.** Step-by-step instructions to run it locally.
-- **Decisions and assumptions.** In particular, anything in the requirements you found unclear or contradictory, and what you decided.
-- **How you used AI.** What you asked it to do, where it got things wrong, and what you changed.
+**Coverage ends on `terminated_on` inclusive. A practice link ends on `unlinked_on` exclusive.** Both are written next to the tables.
 
-## What happens next
+**More than 30 units is rejected unless the office sends `confirm_high_units: true`.** More than 200 is rejected even then. Thirty is allowed without confirmation.
 
-If your submission moves forward, we'll schedule a 45-minute session where you walk us through your code and make a small change to it live. Please be ready to explain any line in the repo.
+**One ICD-10-CM diagnosis, shaped but not looked up in a code set.** We were not given a code set. CPT is five digits. HCPCS is one letter and four digits. Modifiers go in the note. A repeated code is rejected; the count belongs in `units`.
+
+**A reviewer who currently treats that member cannot pick up or decide the case.** A closed relationship does not block. "Currently" is what the requirement says. A lifetime ban would be a one-line change in `eligibility.py`.
+
+**Another reviewer's open case is a 404, not "already assigned."** We do not tell a caller that a chart they cannot see exists.
+
+**Members do not see the clinical note, the denial reason, the reviewer's name, or the documentation briefing.** Offices see the denial reason because they have to act on it. The internal comment stays with the reviewer and the admin. Lists never include the note. Opening a chart that includes the note writes an audit row.
+
+**An approved, denied, or partial request must have `decided_by` and `decided_at`.** That is a database constraint (`ck_decided_request_has_actor`), not only an application check. A denied line must have a reason code and non-blank text. An approved line cannot have denial text.
+
+**Support is a role even though the UM note described a desk rather than a user type.** They get the attempt log and status, which is the minimum they need. Auditors are the next group the team named. An unknown role sees nothing until `policy.py` learns it. Add the role in `can_see_request` and `list_clause` in the same change.
+
+**Decision notices are rows in `notification_outbox`.** This process does not send email. The payload has no clinical note. A worker with a BAA should drain the table.
+
+**The documentation check never approves or denies.** See below.
+
+**Submission attempts keep the member id the office sent, with no foreign key.** Support has to be able to find a typo. The clinical note is not copied onto the attempt. The body hash is enough to recognize a retry.
+
+**Tokens are HMAC, not a JWT library.** There is no algorithm header. The role in the token must still match the user row.
+
+## How AI was used
+
+Cursor, with a coding agent, wrote the first draft of this service from the challenge text. The agent was told to use Python, Postgres, and a documentation model, and to keep the result proprietary.
+
+Three things in that draft were wrong and did not stay:
+
+- The model was on the path that sets `approved` or `denied`. A model does not get a vote. `app/ai.py` checks the note for the diagnosis and the procedure codes, and that is all. If a remote completion contains decision language (`approve`, `deny`, `reject`, "not medically necessary"), the text is thrown away and not stored. The reviewer still gets the in-process checklist, marked `output_rejected`.
+- The member payload included the denial sentence. That is reviewer reasoning. Members see the line status only.
+- "Already happened" was computed in UTC. A Hawaii office would have been judged by a Maine calendar. The date is evaluated in the practice zone.
+
+The remote model is off unless `PRIOR_AUTH_AI_BASE_URL` is set. Leave it empty unless that endpoint is covered by a BAA. A failed or rejected model call does not fail the submission. The office's request is already in the queue.
+
+The test suite includes a scripted model that says "APPROVE" and asserts the stored narrative does not.
+
+## Where to read the code
+
+| File | Why it is here |
+| --- | --- |
+| `app/models.py` | Tables, including the constraint that an approval has an author |
+| `app/validation.py` | Every office-facing rejection message |
+| `app/eligibility.py` | What "active on this date" and "currently treats" mean |
+| `app/service.py` | Submit, pick up, decide, reassign, each in one transaction |
+| `app/visibility.py` | Which fields each role receives |
+| `app/policy.py` | Where a new role has to be added |
+| `app/ai.py` | Advisory briefing and the output guard |
+| `app/auth.py` | The stand-in identity token |
+| `app/api.py` | HTTP |
+| `tests/` | The rules above, including the edges |
+
+## License
+
+All rights reserved. See `LICENSE`. Oxbridge Health may read and run this privately to evaluate the application. No other license is granted.
